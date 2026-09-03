@@ -83,28 +83,8 @@ class MLX_API array {
   array(const array& other) = default;
   array(array&& other) = default;
 
-  /**
-   * Assignment releases the previous descriptor through the destructor so
-   * that the sibling reference cycle of a multi-output primitive is broken
-   * when the last external reference to it goes away by assignment rather
-   * than by destruction. Otherwise a cycle can outlive everything that used
-   * it and keep its inputs (including captured constants) alive forever.
-   */
-  array& operator=(array&& other) & noexcept {
-    if (this != &other) {
-      array previous(std::move(*this));
-      this->array_desc_ = std::move(other.array_desc_);
-    }
-    return *this;
-  }
-
-  array& operator=(const array& other) & {
-    if (this->id() != other.id()) {
-      array previous(std::move(*this));
-      this->array_desc_ = other.array_desc_;
-    }
-    return *this;
-  }
+  array& operator=(array&& other) & = default;
+  array& operator=(const array& other) & = default;
 
   /** The size of the array's datatype in bytes. */
   size_t itemsize() const {
@@ -481,11 +461,8 @@ class MLX_API array {
   void copy_shared_buffer(const array& other);
 
   void overwrite_descriptor(const array& other) {
-    array previous(std::move(*this));
     array_desc_ = other.array_desc_;
   }
-
-  ~array();
 
  private:
   // Initialize the arrays data
@@ -543,11 +520,76 @@ class MLX_API array {
     void init();
   };
 
+  // Owns the array's reference to its descriptor.
+  //
+  // The outputs of a multi-output primitive hold each other through their
+  // sibling lists, so the last reference from outside that cycle has to break
+  // it by hand when it goes away. It can go away by destruction, by assigning
+  // another array over it or through overwrite_descriptor(), and the check
+  // used to run only for the first. Putting it in the type that holds the
+  // reference makes every release run it, including ones written later.
+  class MLX_API DescRef {
+   public:
+    explicit DescRef(std::shared_ptr<ArrayDesc> desc)
+        : desc_(std::move(desc)) {}
+    DescRef(const DescRef& other) = default;
+    DescRef(DescRef&& other) noexcept = default;
+    DescRef& operator=(const DescRef& other) {
+      if (desc_ != other.desc_) {
+        auto previous = std::move(desc_);
+        desc_ = other.desc_;
+        release(previous);
+      }
+      return *this;
+    }
+    DescRef& operator=(DescRef&& other) noexcept {
+      if (this != &other) {
+        auto previous = std::move(desc_);
+        desc_ = std::move(other.desc_);
+        release(previous);
+      }
+      return *this;
+    }
+    ~DescRef() {
+      release(desc_);
+    }
+
+    ArrayDesc* get() const {
+      return desc_.get();
+    }
+    ArrayDesc* operator->() const {
+      return desc_.get();
+    }
+    explicit operator bool() const {
+      return desc_ != nullptr;
+    }
+    long use_count() const {
+      return desc_.use_count();
+    }
+
+    // Give up the reference without the release check. Only for code that is
+    // itself taking a cycle apart, where the check would recurse into the
+    // sibling lists being cleared.
+    void reset_unchecked() {
+      desc_ = nullptr;
+    }
+    std::shared_ptr<ArrayDesc> take_unchecked() {
+      return std::move(desc_);
+    }
+
+   private:
+    // Called with a reference that is about to be dropped. Breaks the sibling
+    // cycle if it is the last reference to it from outside the cycle.
+    static void release(const std::shared_ptr<ArrayDesc>& desc) noexcept;
+
+    std::shared_ptr<ArrayDesc> desc_;
+  };
+
   // The ArrayDesc contains the details of the materialized array including the
   // shape, strides, the data type. It also includes
   // the primitive which knows how to compute the array's data from its inputs
   // and the list of array's inputs for the primitive.
-  std::shared_ptr<ArrayDesc> array_desc_;
+  DescRef array_desc_;
 };
 
 template <typename T>

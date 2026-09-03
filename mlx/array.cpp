@@ -208,35 +208,36 @@ void array::copy_shared_buffer(const array& other) {
   copy_shared_buffer(other, other.strides(), other.flags(), other.data_size());
 }
 
-array::~array() {
-  if (array_desc_ == nullptr) {
+void array::DescRef::release(const std::shared_ptr<ArrayDesc>& desc) noexcept {
+  if (desc == nullptr) {
     return;
   }
 
   // Detached/detaching
-  if (array_desc_->primitive == nullptr) {
+  if (desc->primitive == nullptr) {
     return;
   }
 
   // Break circular reference for non-detached arrays with siblings
-  if (auto n = siblings().size(); n > 0) {
+  auto& siblings = desc->siblings;
+  if (auto n = siblings.size(); n > 0) {
     bool do_detach = true;
     // If all siblings have siblings.size() references except
-    // the one we are currently destroying (which has siblings.size() + 1)
+    // the one we are currently releasing (which has siblings.size() + 1)
     // then there are no more external references
-    do_detach &= (array_desc_.use_count() == (n + 1));
-    for (auto& s : siblings()) {
+    do_detach &= (desc.use_count() == (n + 1));
+    for (auto& s : siblings) {
       do_detach &= (s.array_desc_.use_count() == n);
       if (!do_detach) {
         break;
       }
     }
     if (do_detach) {
-      for (auto& s : siblings()) {
-        for (auto& ss : s.siblings()) {
-          // Set to null here to avoid descending into array destructor
+      for (auto& s : siblings) {
+        for (auto& ss : s.array_desc_->siblings) {
+          // Drop without the release check to avoid descending into it
           // for siblings
-          ss.array_desc_ = nullptr;
+          ss.array_desc_.reset_unchecked();
         }
         s.array_desc_->siblings.clear();
       }
@@ -313,7 +314,7 @@ array::ArrayDesc::~ArrayDesc() {
             s.array_desc_.use_count() <= a.siblings().size() + is_input;
       }
       if (is_deletable) {
-        for_deletion.push_back(std::move(a.array_desc_));
+        for_deletion.push_back(a.array_desc_.take_unchecked());
       }
     }
   };
@@ -331,7 +332,7 @@ array::ArrayDesc::~ArrayDesc() {
     for (auto& s : top->siblings) {
       // Set to null here to avoid descending into top-level
       // array destructor for siblings
-      s.array_desc_ = nullptr;
+      s.array_desc_.reset_unchecked();
     }
     top->siblings.clear();
   }
